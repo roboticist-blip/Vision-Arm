@@ -188,7 +188,8 @@ Disconnect IO0–GND after flashing and press RESET.
 ### 6.2 PC Python Environment
 
 ```bash
-cd pc_side
+git clone https://github.com/roboticist-blip/Vision-Arm.git
+cd Vision-Arm/pc_side
 pip install -r requirements.txt
 ```
 
@@ -207,7 +208,7 @@ Dependencies installed:
 
 ### Step 1 — Power on
 
-1. Power servos from external 5 V supply
+1. Power servos from an external 5 V supply
 2. Power ESP32-CAM via USB
 3. Wait ~5 s for WiFi connection (LED blinks, then stays on)
 
