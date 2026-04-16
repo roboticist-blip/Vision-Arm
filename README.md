@@ -189,7 +189,7 @@ Disconnect IO0–GND after flashing and press RESET.
 
 ```bash
 git clone https://github.com/roboticist-blip/Vision-Arm.git
-cd Vision-Arm/pc_side
+cd Vision-Arm
 pip install -r requirements.txt
 ```
 
