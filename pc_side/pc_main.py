@@ -17,27 +17,29 @@ import argparse
 import threading
 import time
 import numpy as np
+import websocket
+
+# MediaPipe NEW API
 import mediapipe as mp
-import websocket        # websocket-client
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
 from arm_kinematics import hand_to_arm, angles_to_cmd
 
-# ── CLI args ──────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--ip",   required=True, help="ESP32-CAM IP address")
-parser.add_argument("--fps",  type=int, default=20, help="Target processing FPS")
+parser.add_argument("--ip", required=True, help="ESP32-CAM IP address")
+parser.add_argument("--fps", type=int, default=20)
 args = parser.parse_args()
 
 STREAM_URL = f"http://{args.ip}/stream"
 WS_URL     = f"ws://{args.ip}:81"
 
-# ── Globals ───────────────────────────────────────────────────────────────────
 latest_frame = None
 frame_lock   = threading.Lock()
 ws_conn      = None
 last_cmd     = ""
 running      = True
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
 def ws_thread():
     global ws_conn
     while running:
@@ -45,7 +47,7 @@ def ws_thread():
             ws_conn = websocket.create_connection(WS_URL, timeout=5)
             print(f"[WS] Connected to {WS_URL}")
             while running:
-                time.sleep(0.5)   # keep alive; sends happen from main thread
+                time.sleep(0.5)
             ws_conn.close()
         except Exception as e:
             print(f"[WS] Reconnecting... ({e})")
@@ -62,42 +64,50 @@ def send_command(cmd: str):
     except Exception as e:
         print(f"[WS] Send error: {e}")
 
-# ── MJPEG stream reader ───────────────────────────────────────────────────────
 def stream_thread():
     global latest_frame, running
     cap = cv2.VideoCapture(STREAM_URL)
+
     if not cap.isOpened():
         print(f"[CAM] Cannot open stream at {STREAM_URL}")
         running = False
         return
-    print(f"[CAM] Stream opened")
+
+    print("[CAM] Stream opened")
+
     while running:
         ret, frame = cap.read()
         if ret:
             with frame_lock:
                 latest_frame = frame
+
     cap.release()
 
-# ── MediaPipe setup ───────────────────────────────────────────────────────────
-mp_hands   = mp.solutions.hands
-mp_draw    = mp.solutions.drawing_utils
-hands_model = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
+BaseOptions = python.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path="hand_landmarker.task"),
+    running_mode=VisionRunningMode.VIDEO,
+    num_hands=1,
+    min_hand_detection_confidence=0.7,
     min_tracking_confidence=0.6,
 )
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+landmarker = HandLandmarker.create_from_options(options)
+
 def main():
     global running
 
     t_stream = threading.Thread(target=stream_thread, daemon=True)
-    t_ws     = threading.Thread(target=ws_thread,     daemon=True)
+    t_ws     = threading.Thread(target=ws_thread, daemon=True)
+
     t_stream.start()
     t_ws.start()
 
-    time.sleep(1.5)   # wait for stream init
+    time.sleep(1.5)
 
     frame_interval = 1.0 / args.fps
     next_tick = time.time()
@@ -118,31 +128,62 @@ def main():
             continue
 
         h, w = frame.shape[:2]
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands_model.process(rgb)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # ── MediaPipe processing ──
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int(time.time() * 1000)
+
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
         overlay = frame.copy()
 
-        if result.multi_hand_landmarks:
-            hand_lm = result.multi_hand_landmarks[0]
-            mp_draw.draw_landmarks(overlay, hand_lm, mp_hands.HAND_CONNECTIONS)
+        if result.hand_landmarks:
+            hand_lm = result.hand_landmarks[0]
 
-            angles = hand_to_arm(hand_lm.landmark, w, h)
+            # Convert to old-style landmark objects (for your IK function)
+            class LM:
+                def __init__(self, x, y, z):
+                    self.x = x
+                    self.y = y
+                    self.z = z
+
+            landmarks = [LM(l.x, l.y, l.z) for l in hand_lm]
+
+            # Draw landmarks (manual)
+            for lm in hand_lm:
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                cv2.circle(overlay, (cx, cy), 3, (0, 255, 0), -1)
+
+            angles = hand_to_arm(landmarks, w, h)
             cmd    = angles_to_cmd(angles)
             send_command(cmd)
 
             # HUD
             grip_label = "GRAB" if angles["grip"] else "OPEN"
             grip_color = (0, 60, 255) if angles["grip"] else (60, 220, 60)
-            cv2.putText(overlay, f"Base:{angles['base']}  J1:{angles['j1']}  J2:{angles['j2']}",
-                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
-            cv2.putText(overlay, f"J3:{angles['j3']}  J4:{angles['j4']}  Grip:{grip_label}",
-                        (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, grip_color, 1)
+
+            cv2.putText(overlay,
+                        f"Base:{angles['base']}  J1:{angles['j1']}  J2:{angles['j2']}",
+                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (200, 200, 200), 1)
+
+            cv2.putText(overlay,
+                        f"J3:{angles['j3']}  J4:{angles['j4']}  Grip:{grip_label}",
+                        (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        grip_color, 1)
+
         else:
-            cv2.putText(overlay, "No hand detected", (8, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 1)
+            cv2.putText(overlay,
+                        "No hand detected",
+                        (8, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (80, 80, 255),
+                        1)
 
         cv2.imshow("Robotic Arm — Hand Control", overlay)
+
         if cv2.waitKey(1) & 0xFF == ord("q"):
             running = False
             break
